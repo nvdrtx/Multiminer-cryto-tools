@@ -18,16 +18,25 @@ from PySide6.QtCore import QObject, Signal, QProcess
 from config_manager import MinerConfig
 
 
-# Exemples de lignes typiques produites par cpuminer-multi :
-#   [2024-01-01 12:00:05] thread 0: 123456 hashes, 12.35 khash/s
-#   [2024-01-01 12:00:05] accepted: 1/1 (100.00%), 12.35 khash/s (yay!!!)
-#   [2024-01-01 12:00:00] Stratum authentication succeeded
-#   [2024-01-01 12:00:00] Stratum connection failed
-HASHRATE_RE = re.compile(r"([\d.]+)\s*khash/s", re.IGNORECASE)
+# Exemples de lignes réellement produites par cpuminer-multi (tpruvot,
+# v1.3.1 confirmé) :
+#   [2026-08-20 12:13:09] CPU #3: 7133 kH/s
+#   [2026-08-20 12:13:09] accepted: 1/1 (100.00%), 7133 kH/s (yay!!!)
+#   [2026-08-20 12:13:08] Stratum authentication succeeded
+#   [2026-08-20 12:13:08] Stratum connection failed
+#
+# Le hashrate est rapporté par thread, de façon asynchrone (chaque
+# coeur logue indépendamment) : on garde le dernier débit connu de
+# chaque thread et on additionne pour obtenir le total en temps réel.
+THREAD_RATE_RE = re.compile(
+    r"(?:CPU\s*#(\d+)|thread\s+(\d+))\s*:\s*([\d.]+)\s*([kKmMgG]?)H/s"
+)
 ACCEPTED_RE = re.compile(r"accepted:\s*(\d+)/(\d+)", re.IGNORECASE)
 AUTH_OK_RE = re.compile(r"authentication succeeded", re.IGNORECASE)
 CONN_FAIL_RE = re.compile(r"(connection failed|connect failed|couldn't connect)", re.IGNORECASE)
 INVALID_ADDR_RE = re.compile(r"(invalid address|invalid username)", re.IGNORECASE)
+
+_UNIT_TO_KHS = {"": 0.001, "k": 1.0, "m": 1000.0, "g": 1_000_000.0}
 
 
 class MinerController(QObject):
@@ -47,6 +56,9 @@ class MinerController(QObject):
         self._process: QProcess | None = None
         self._accepted = 0
         self._submitted = 0
+        self._thread_rates_khs: dict = {}  # {thread_id: dernier débit connu en kH/s}
+        self._stop_requested = False
+        self._received_output = False
 
     def is_running(self) -> bool:
         return self._process is not None and self._process.state() != QProcess.NotRunning
@@ -74,6 +86,9 @@ class MinerController(QObject):
 
         self._accepted = 0
         self._submitted = 0
+        self._thread_rates_khs = {}
+        self._stop_requested = False
+        self._received_output = False
 
         self._process = QProcess(self)
         self._process.setProcessChannelMode(QProcess.MergedChannels)
@@ -99,6 +114,7 @@ class MinerController(QObject):
         self.status_changed.emit("en_cours")
 
     def stop(self) -> None:
+        self._stop_requested = True
         if not self.is_running():
             self.status_changed.emit("arrete")
             return
@@ -121,13 +137,19 @@ class MinerController(QObject):
             line = line.strip()
             if not line:
                 continue
+            self._received_output = True
             self.log_line.emit(line)
             self._parse_line(line)
 
     def _parse_line(self, line: str) -> None:
-        hashrate_match = HASHRATE_RE.search(line)
-        if hashrate_match:
-            self.hashrate_updated.emit(float(hashrate_match.group(1)))
+        thread_match = THREAD_RATE_RE.search(line)
+        if thread_match:
+            thread_id = thread_match.group(1) or thread_match.group(2)
+            raw_value = float(thread_match.group(3))
+            unit = (thread_match.group(4) or "").lower()
+            rate_khs = raw_value * _UNIT_TO_KHS.get(unit, 1.0)
+            self._thread_rates_khs[thread_id] = rate_khs
+            self.hashrate_updated.emit(sum(self._thread_rates_khs.values()))
 
         accepted_match = ACCEPTED_RE.search(line)
         if accepted_match:
@@ -150,6 +172,11 @@ class MinerController(QObject):
             self.status_changed.emit("erreur")
 
     def _on_process_error(self, error: QProcess.ProcessError) -> None:
+        if self._stop_requested and error == QProcess.Crashed:
+            # terminate()/kill() déclenchent parfois ce signal même pour un
+            # arrêt volontaire demandé par l'utilisateur : pas une erreur.
+            return
+
         messages = {
             QProcess.FailedToStart: (
                 "Le mineur n'a pas pu démarrer (fichier introuvable ou "
@@ -166,10 +193,33 @@ class MinerController(QObject):
         self.status_changed.emit("erreur")
 
     def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        if self._stop_requested:
+            self.status_changed.emit("arrete")
+            return
+
         if exit_status == QProcess.CrashExit:
             self.error_occurred.emit(
                 "Le processus de minage s'est terminé de manière inattendue "
                 f"(code {exit_code})."
+            )
+            self.status_changed.emit("erreur")
+        elif not self._received_output:
+            self.error_occurred.emit(
+                "Le mineur s'est arrêté immédiatement, sans produire aucune "
+                "sortie (code de sortie "
+                f"{exit_code}). Causes fréquentes : l'antivirus/Windows "
+                "Defender a mis le fichier en quarantaine ou l'a bloqué au "
+                "lancement (fréquent avec les mineurs, faux positif "
+                "classique), le fichier est corrompu ou a été déplacé "
+                "depuis un précédent scan antivirus. Essayez de relancer le "
+                "téléchargement du mineur (voir Paramètres), ou vérifiez "
+                "l'historique de protection de Windows Defender."
+            )
+            self.status_changed.emit("erreur")
+        elif exit_code != 0:
+            self.error_occurred.emit(
+                f"Le mineur s'est arrêté avec une erreur (code {exit_code}). "
+                "Consultez les dernières lignes du journal ci-dessus pour le détail."
             )
             self.status_changed.emit("erreur")
         else:

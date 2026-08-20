@@ -46,6 +46,8 @@ class GpuMinerController(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._process: QProcess | None = None
+        self._stop_requested = False
+        self._received_output = False
 
     def is_running(self) -> bool:
         return self._process is not None and self._process.state() != QProcess.NotRunning
@@ -72,6 +74,9 @@ class GpuMinerController(QObject):
             "--nocolor",
         ]
 
+        self._stop_requested = False
+        self._received_output = False
+
         self._process = QProcess(self)
         self._process.setProcessChannelMode(QProcess.MergedChannels)
         self._process.readyReadStandardOutput.connect(self._on_output)
@@ -96,6 +101,7 @@ class GpuMinerController(QObject):
         self.status_changed.emit("en_cours")
 
     def stop(self) -> None:
+        self._stop_requested = True
         if not self.is_running():
             self.status_changed.emit("arrete")
             return
@@ -117,6 +123,7 @@ class GpuMinerController(QObject):
             line = line.strip()
             if not line:
                 continue
+            self._received_output = True
             self.log_line.emit(line)
             self._parse_line(line)
 
@@ -143,6 +150,9 @@ class GpuMinerController(QObject):
             self.status_changed.emit("erreur")
 
     def _on_process_error(self, error: QProcess.ProcessError) -> None:
+        if self._stop_requested and error == QProcess.Crashed:
+            return
+
         messages = {
             QProcess.FailedToStart: (
                 "Le mineur GPU n'a pas pu démarrer (fichier introuvable ou "
@@ -159,10 +169,29 @@ class GpuMinerController(QObject):
         self.status_changed.emit("erreur")
 
     def _on_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+        if self._stop_requested:
+            self.status_changed.emit("arrete")
+            return
+
         if exit_status == QProcess.CrashExit:
             self.error_occurred.emit(
                 "Le processus de minage GPU s'est terminé de manière inattendue "
                 f"(code {exit_code})."
+            )
+            self.status_changed.emit("erreur")
+        elif not self._received_output:
+            self.error_occurred.emit(
+                "Le mineur GPU s'est arrêté immédiatement, sans produire "
+                f"aucune sortie (code de sortie {exit_code}). Causes "
+                "fréquentes : l'antivirus a bloqué le fichier, pilote GPU "
+                "manquant, ou fichier corrompu. Essayez de retélécharger le "
+                "mineur GPU (voir Paramètres)."
+            )
+            self.status_changed.emit("erreur")
+        elif exit_code != 0:
+            self.error_occurred.emit(
+                f"Le mineur GPU s'est arrêté avec une erreur (code {exit_code}). "
+                "Consultez les dernières lignes du journal ci-dessus pour le détail."
             )
             self.status_changed.emit("erreur")
         else:

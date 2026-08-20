@@ -193,6 +193,59 @@ def _validate_executable(path: str, label: str, hint: str) -> None:
         )
 
 
+def _validate_gpu_wallet_format(address: str, algo: str) -> None:
+    """
+    Vérifie que le format de l'adresse correspond bien à la crypto
+    minée par l'algorithme choisi, pour éviter le cas classique où le
+    pool rejette silencieusement ("Worker not authorized") parce que
+    l'adresse est celle d'une autre chaîne.
+    """
+    is_eth_style = bool(re.match(r"^0x[0-9a-fA-F]{40}$", address.strip()))
+
+    if algo == "ETHASH" and not is_eth_style:
+        raise ConfigError(
+            "L'algorithme GPU est réglé sur Ethash (OctaSpace), qui utilise "
+            "des adresses au format Ethereum (0x... suivi de 40 caractères "
+            "hexadécimaux). Votre adresse wallet GPU ne correspond pas à ce "
+            "format — vérifiez que vous utilisez bien un wallet compatible "
+            "OctaSpace (ex. MetaMask), pas une adresse Ergo."
+        )
+
+    if algo == "AUTOLYKOS2" and is_eth_style:
+        raise ConfigError(
+            "L'algorithme GPU est réglé sur Autolykos2 (Ergo), qui n'utilise "
+            "pas d'adresses au format Ethereum (0x...). Votre adresse wallet "
+            "GPU ressemble à une adresse Ethereum/OctaSpace — vérifiez que "
+            "vous utilisez bien un wallet Ergo."
+        )
+
+
+def _validate_gpu_pool_algo_match(pool_host: str, algo: str) -> None:
+    """
+    Vérification heuristique : de nombreux pools indiquent la crypto
+    minée dans leur nom d'hôte (octa.*, ergo.*, *.nanopool.org pour
+    Ergo, etc.). Si le nom du pool suggère clairement une autre
+    algorithme que celui sélectionné, on bloque avant que le pool ne
+    rejette silencieusement l'autorisation au démarrage.
+    """
+    host_lower = pool_host.lower()
+
+    if "octa" in host_lower and algo != "ETHASH":
+        raise ConfigError(
+            f"L'adresse du pool GPU ({pool_host}) semble être un pool "
+            "OctaSpace, mais l'algorithme sélectionné n'est pas Ethash. "
+            "Choisissez \"Ethash (OctaSpace)\" dans Algorithme, ou changez "
+            "de pool."
+        )
+
+    if "ergo" in host_lower and algo != "AUTOLYKOS2":
+        raise ConfigError(
+            f"L'adresse du pool GPU ({pool_host}) semble être un pool Ergo, "
+            "mais l'algorithme sélectionné n'est pas Autolykos2. Choisissez "
+            "\"Autolykos2 (Ergo)\" dans Algorithme, ou changez de pool."
+        )
+
+
 def validate_config(config: MinerConfig) -> None:
     """
     Valide uniquement les profils actifs selon `mining_mode`. Un profil
@@ -223,3 +276,5 @@ def validate_config(config: MinerConfig) -> None:
         )
         if not config.gpu_algo:
             raise ConfigError("Aucun algorithme GPU sélectionné.")
+        _validate_gpu_wallet_format(config.gpu_wallet_address, config.gpu_algo)
+        _validate_gpu_pool_algo_match(config.gpu_pool_host, config.gpu_algo)
