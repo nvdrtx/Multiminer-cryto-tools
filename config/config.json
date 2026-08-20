@@ -1,0 +1,15 @@
+{
+  "mining_mode": "cpu",
+  "pool_host": "",
+  "pool_port": 3333,
+  "wallet_address": "",
+  "worker_name": "worker1",
+  "miner_executable": "",
+  "threads": 0,
+  "gpu_pool_host": "",
+  "gpu_pool_port": 11111,
+  "gpu_wallet_address": "",
+  "gpu_worker_name": "worker1",
+  "gpu_miner_executable": "",
+  "gpu_algo": "AUTOLYKOS2"
+}
